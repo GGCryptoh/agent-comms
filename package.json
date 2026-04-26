@@ -1,0 +1,26 @@
+{
+  "name": "agent-comms",
+  "version": "1.0.0",
+  "description": "Local-network A2A communication server for Claude Code instances — push context between agents over LAN or Tailscale",
+  "main": "server.js",
+  "bin": {
+    "agent-comms": "./bin/agent-comms",
+    "agent-comms-server": "./server.js"
+  },
+  "scripts": {
+    "start": "node server.js",
+    "configure": "bash scripts/configure.sh",
+    "install:service": "bash scripts/install.sh"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/GGCryptoh/agent-comms.git"
+  }
+}

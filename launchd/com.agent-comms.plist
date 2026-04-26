@@ -1,0 +1,45 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Template plist — rendered by scripts/install.sh.
+  Substitutes: __HOME__ (user home) and __REPO__ (path to this repo).
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agent-comms</string>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>-lc</string>
+    <string>set -a; [ -f "$HOME/.claude/.env" ] &amp;&amp; source "$HOME/.claude/.env"; set +a; exec /usr/bin/env node "__REPO__/server.js"</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>__REPO__</string>
+
+  <key>RunAtLoad</key>
+  <true/>
+
+  <key>KeepAlive</key>
+  <true/>
+
+  <key>ThrottleInterval</key>
+  <integer>10</integer>
+
+  <key>StandardOutPath</key>
+  <string>__HOME__/Library/Logs/agent-comms.log</string>
+
+  <key>StandardErrorPath</key>
+  <string>__HOME__/Library/Logs/agent-comms.log</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>PATH</key>
+    <string>/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin</string>
+    <key>HOME</key>
+    <string>__HOME__</string>
+  </dict>
+</dict>
+</plist>

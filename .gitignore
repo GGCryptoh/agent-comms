@@ -1,0 +1,19 @@
+node_modules/
+dist/
+build/
+
+# Local env (token + chat ids — never commit)
+.env
+.env.local
+.env.*.local
+
+# macOS noise
+.DS_Store
+
+# Logs
+*.log
+logs/
+
+# The on-disk inbound dir, in case anyone runs the server from inside the repo
+inbound/
+.agent-comms/

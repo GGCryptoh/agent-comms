@@ -1,0 +1,387 @@
+#!/usr/bin/env node
+// agent-comms CLI — discover, pair, accept, manage peers.
+//
+// Talks to the local agent-comms server (HTTP on AGENT_COMMS_PORT) for
+// state-mutating ops. Uses lib/discovery.js directly for UDP probes.
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+
+// Find the repo root so lib/ + state.js work regardless of cwd.
+const REPO_ROOT = path.resolve(__dirname, '..');
+const state = require(path.join(REPO_ROOT, 'lib', 'state'));
+const pairing = require(path.join(REPO_ROOT, 'lib', 'pairing'));
+const discovery = require(path.join(REPO_ROOT, 'lib', 'discovery'));
+
+// Load AGENT_COMMS_* env from ~/.claude/.env (same as server.js).
+(function loadEnv() {
+  const envPath = path.join(os.homedir(), '.claude', '.env');
+  if (!fs.existsSync(envPath)) return;
+  for (const line of fs.readFileSync(envPath, 'utf-8').split('\n')) {
+    const m = line.match(/^([^#=]+)=(.*)$/);
+    if (m && !process.env[m[1].trim()]) {
+      process.env[m[1].trim()] = m[2].trim().replace(/^"(.*)"$/, '$1');
+    }
+  }
+})();
+
+const PORT = parseInt(process.env.AGENT_COMMS_PORT || '8090', 10);
+const LOCAL_BASE = `http://127.0.0.1:${PORT}`;
+
+// ── tiny arg parser ─────────────────────────────────────────────────
+// Supports positional args, long flags `--key value`, `--key=value`, and
+// boolean flags `--flag`. No external dep.
+function parseArgs(argv) {
+  const positional = [];
+  const flags = {};
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a.startsWith('--')) {
+      const eq = a.indexOf('=');
+      if (eq > 0) {
+        flags[a.slice(2, eq)] = a.slice(eq + 1);
+      } else {
+        const next = argv[i + 1];
+        if (next === undefined || next.startsWith('--')) {
+          flags[a.slice(2)] = true;
+        } else {
+          flags[a.slice(2)] = next;
+          i++;
+        }
+      }
+    } else {
+      positional.push(a);
+    }
+  }
+  return { positional, flags };
+}
+
+async function http(method, url, body) {
+  const opts = { method, headers: {} };
+  if (body !== undefined) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  const r = await fetch(url, opts);
+  let parsed;
+  try { parsed = await r.json(); } catch { parsed = {}; }
+  return { ok: r.ok, status: r.status, body: parsed };
+}
+
+function fail(msg, code = 1) {
+  console.error(`Error: ${msg}`);
+  process.exit(code);
+}
+
+function log(...args) { console.log(...args); }
+
+// Convert a duration string ("30d", "6h", "never", "once") to:
+//   { policy, expires_at }
+function parseDuration(input) {
+  if (!input) return { policy: 'indefinite', expires_at: null };
+  const v = String(input).toLowerCase().trim();
+  if (v === 'never' || v === 'indefinite' || v === '0') return { policy: 'indefinite', expires_at: null };
+  if (v === 'once' || v === 'single' || v === 'single-shot') return { policy: 'single-shot', expires_at: null };
+  const m = v.match(/^(\d+)\s*([smhdwy])$/);
+  if (!m) return null;
+  const n = parseInt(m[1], 10);
+  const unit = m[2];
+  const ms = { s: 1000, m: 60_000, h: 3_600_000, d: 86_400_000, w: 604_800_000, y: 31_536_000_000 }[unit];
+  return {
+    policy: 'time-bounded',
+    expires_at: new Date(Date.now() + n * ms).toISOString(),
+  };
+}
+
+// ── commands ────────────────────────────────────────────────────────
+
+async function cmdInit(flags) {
+  state.ensureDir();
+  const existing = state.readIdentity();
+  const name = flags.name || (existing && existing.display_name) || os.hostname();
+  if (!existing) {
+    const id = state.ensureIdentity(name);
+    log(`Identity created: ${id.display_name} (${id.instance_id})`);
+  } else if (flags.name && existing.display_name !== flags.name) {
+    state.writeIdentity({ ...existing, display_name: flags.name });
+    log(`Identity renamed: ${existing.display_name} → ${flags.name}`);
+  } else {
+    log(`Identity exists: ${existing.display_name} (${existing.instance_id})`);
+  }
+  if (!state.readPairingCode()) {
+    const code = pairing.generateCode();
+    state.writePairingCode(code);
+    log(`Pairing code generated: ${code}`);
+  } else {
+    log(`Pairing code on file: ${state.readPairingCode()}`);
+  }
+  log('');
+  log('Next: start the server (npm start), then on the other machine run:');
+  log(`  agent-comms discover --lan`);
+}
+
+async function cmdCode(positional) {
+  const sub = positional[0];
+  if (sub === 'rotate') {
+    const r = await http('POST', `${LOCAL_BASE}/a2a/code/rotate`);
+    if (!r.ok) return fail(`rotate failed (${r.status}): ${r.body.error || ''}`);
+    log(`New pairing code: ${r.body.code}`);
+    return;
+  }
+  // default: show
+  const r = await http('GET', `${LOCAL_BASE}/a2a/code`);
+  if (!r.ok) return fail(`couldn't read code (${r.status}). Is the server running on ${LOCAL_BASE}?`);
+  log('');
+  log(`  ${r.body.code}`);
+  log('');
+  log(`Identity: ${r.body.display_name} (${r.body.instance_id.slice(0, 8)}…)`);
+  log(`Read these six words to the operator on the other machine.`);
+}
+
+async function cmdDiscover(flags) {
+  const timeout = parseInt(flags.timeout || '5', 10) * 1000;
+  log(`Probing 239.42.42.42:18742 for ${timeout/1000}s...`);
+  let offers;
+  try {
+    offers = await discovery.discover({ timeoutMs: timeout, log: msg => log(`  ${msg}`) });
+  } catch (e) {
+    return fail(`discovery failed: ${e.message}`);
+  }
+  if (offers.length === 0) {
+    log('No agent-comms servers found on the LAN.');
+    log('Hints: are both machines on the same wifi? Is the other side in lan/tailnet mode (not localhost)? Is multicast allowed by the local firewall?');
+    return;
+  }
+  log('');
+  log(`Found ${offers.length} server${offers.length === 1 ? '' : 's'}:`);
+  log('');
+  offers.forEach((o, i) => {
+    log(`  [${i + 1}] ${o.display_name || '(unnamed)'} `);
+    log(`      endpoint: ${o.endpoint}`);
+    log(`      instance: ${(o.instance_id || '').slice(0, 8)}…`);
+    log(`      mode:     ${o.mode || '?'}    capabilities: ${(o.capabilities || []).join(', ')}`);
+    log('');
+  });
+  log('To pair, ask the other operator for their 6-word pairing code, then:');
+  log(`  agent-comms pair <endpoint> --code "<six words>"`);
+}
+
+async function cmdPair(positional, flags) {
+  const endpoint = positional[0];
+  if (!endpoint) return fail('usage: agent-comms pair <endpoint> --code "<six words>" [--rel tier] [--expires 30d|never|once]');
+  if (!flags.code) return fail('--code required ("six words from BIP-39")');
+  if (!pairing.isValidCode(flags.code)) {
+    return fail('--code must be exactly 6 BIP-39 words (letters and spaces only)');
+  }
+
+  const id = state.ensureIdentity(flags.name || os.hostname());
+  // Our own endpoint to share with the remote (best effort).
+  const ifs = os.networkInterfaces();
+  let myIp = '127.0.0.1';
+  for (const list of Object.values(ifs)) {
+    for (const a of list || []) {
+      if (a.family === 'IPv4' && !a.internal) { myIp = a.address; break; }
+    }
+    if (myIp !== '127.0.0.1') break;
+  }
+  const myEndpoint = `http://${myIp}:${PORT}`;
+
+  const dur = parseDuration(flags.expires);
+  if (flags.expires && !dur) return fail(`bad --expires "${flags.expires}" (use 30d, 6h, never, once, etc.)`);
+
+  log(`Sending pair request to ${endpoint}...`);
+  const reqBody = {
+    from_id: id.instance_id,
+    from_name: id.display_name,
+    from_endpoint: myEndpoint,
+    code: pairing.normalizeCode(flags.code),
+    requested_rel: flags.rel || null,
+    requested_expiry: dur ? dur.policy : null,
+    requested_expires_at: dur ? dur.expires_at : null,
+  };
+  const r = await http('POST', `${endpoint.replace(/\/$/, '')}/a2a/pair-request`, reqBody);
+  if (!r.ok) return fail(`pair-request rejected (${r.status}): ${r.body.error || ''}`);
+  const pendingId = r.body.pending_id;
+  log(`✓ Request sent. Pending id: ${pendingId.slice(0, 8)}…`);
+  log(`  Waiting for ${r.body.receiver.display_name} operator to accept (Ctrl-C to cancel)...`);
+
+  const deadline = Date.now() + 5 * 60 * 1000;
+  while (Date.now() < deadline) {
+    await new Promise(r => setTimeout(r, 2000));
+    const poll = await http('GET', `${endpoint.replace(/\/$/, '')}/a2a/pair-status/${pendingId}`);
+    if (poll.status === 404) return fail('pair request expired without response');
+    if (!poll.ok) {
+      log(`  (${poll.status} polling — retrying)`);
+      continue;
+    }
+    const status = poll.body.status;
+    if (status === 'pending') { process.stdout.write('.'); continue; }
+    if (status === 'blocked') { log('\n✗ The other operator blocked this request.'); process.exit(2); }
+    if (status === 'accepted') {
+      log('');
+      log(`✓ Accepted by ${poll.body.receiver.display_name}.`);
+      const localPeerId = (poll.body.receiver.display_name || 'peer')
+        .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '')
+        || `peer-${poll.body.receiver.instance_id.slice(0, 8)}`;
+      const record = {
+        instance_id: poll.body.receiver.instance_id,
+        display_name: poll.body.receiver.display_name,
+        endpoint: poll.body.receiver.endpoint,
+        rel: (poll.body.peer_record && poll.body.peer_record.rel) || flags.rel || 'friend',
+        paired_at: new Date().toISOString(),
+        paired_via: 'lan-pairing-code',
+        bearer_token: poll.body.bearer_token || '',
+        expiry_policy: dur ? dur.policy : 'indefinite',
+        expires_at: dur ? dur.expires_at : null,
+        single_shot_used: false,
+      };
+      state.addPeer(localPeerId, record);
+      log(`✓ Saved peer "${localPeerId}" → ${record.endpoint}`);
+      if (record.bearer_token) {
+        log(`✓ Stored bearer token (${record.bearer_token.length} chars)`);
+      }
+      log('');
+      log(`Try: curl -X POST ${record.endpoint}/context/push \\`);
+      log(`       -H "Authorization: Bearer ${record.bearer_token ? '$TOKEN' : ''}" \\`);
+      log(`       -H "Content-Type: application/json" \\`);
+      log(`       -d '{"from":"${id.display_name}","topic":"hello","content":"# pair check"}'`);
+      return;
+    }
+    log(`  unexpected status: ${status}`);
+  }
+  fail('timed out waiting for accept (5 min). Re-run when the other operator is ready.');
+}
+
+async function cmdPending() {
+  // Read directly from local state — no need for the server to be up.
+  const list = state.readPending();
+  if (!list || list.length === 0) {
+    log('No pending pair requests.');
+    return;
+  }
+  list.forEach(p => {
+    log(`  ${p.pending_id.slice(0, 8)}  ${p.from_name}  (${p.from_id.slice(0, 8)}, ${p.from_ip})  received ${p.received_at}`);
+    if (p.requested_rel || p.requested_expiry) {
+      log(`    requested: rel=${p.requested_rel || '(default)'} expiry=${p.requested_expiry || 'indefinite'}`);
+    }
+  });
+  log('');
+  log('To accept:  agent-comms accept <id> [--rel friend|business|full_authority] [--expires 30d|never|once]');
+  log('To block:   agent-comms block <id>');
+}
+
+async function cmdAccept(positional, flags) {
+  const id = positional[0];
+  if (!id) return fail('usage: agent-comms accept <id> [--rel tier] [--expires duration]');
+  const dur = parseDuration(flags.expires);
+  if (flags.expires && !dur) return fail(`bad --expires (use 30d, 6h, never, once, etc.)`);
+
+  // Resolve prefix → full pending_id from local state (so prefix matching
+  // doesn't depend on the server being reachable).
+  const list = state.readPending();
+  const matches = list.filter(p => p.pending_id.startsWith(id));
+  if (matches.length === 0) return fail(`no pending request matching "${id}"`);
+  if (matches.length > 1) return fail(`ambiguous prefix "${id}" — matches ${matches.length} requests`);
+  const fullId = matches[0].pending_id;
+
+  const r = await http('POST', `${LOCAL_BASE}/a2a/accept/${fullId}`, {
+    rel: flags.rel || null,
+    expiry: dur ? dur.policy : null,
+    expires_at: dur ? dur.expires_at : null,
+  });
+  if (!r.ok) return fail(`accept failed (${r.status}): ${r.body.error || ''}`);
+  log(`✓ Accepted. Stored as peer "${r.body.peer_local_id}".`);
+  log(`  rel=${r.body.peer_record.rel}  expiry=${r.body.peer_record.expiry_policy}${r.body.peer_record.expires_at ? ` (until ${r.body.peer_record.expires_at})` : ''}`);
+}
+
+async function cmdBlock(positional) {
+  const id = positional[0];
+  if (!id) return fail('usage: agent-comms block <id>');
+  const list = state.readPending();
+  const matches = list.filter(p => p.pending_id.startsWith(id));
+  if (matches.length === 0) return fail(`no pending request matching "${id}"`);
+  if (matches.length > 1) return fail(`ambiguous prefix "${id}"`);
+  const fullId = matches[0].pending_id;
+  const r = await http('POST', `${LOCAL_BASE}/a2a/block/${fullId}`);
+  if (!r.ok) return fail(`block failed (${r.status}): ${r.body.error || ''}`);
+  log(`✓ Blocked (24h cooldown).`);
+}
+
+async function cmdPeers(positional) {
+  const sub = positional[0];
+  if (sub === 'remove') {
+    const peerId = positional[1];
+    if (!peerId) return fail('usage: agent-comms peers remove <local-id>');
+    if (!state.removePeer(peerId)) return fail(`peer "${peerId}" not found`);
+    log(`✓ Removed peer "${peerId}"`);
+    return;
+  }
+  // Read from local state directly — works whether or not the server is up.
+  const peers = state.readPeers();
+  const ids = Object.keys(peers);
+  if (ids.length === 0) { log('No paired peers.'); return; }
+  ids.forEach(id => {
+    const p = peers[id];
+    log(`  ${id}`);
+    log(`    name: ${p.display_name}    rel: ${p.rel}`);
+    log(`    endpoint: ${p.endpoint || '(unknown)'}    paired: ${p.paired_at}`);
+    log(`    expiry: ${p.expiry_policy}${p.expires_at ? ` (until ${p.expires_at})` : ''}`);
+  });
+}
+
+function usage() {
+  log(`agent-comms — local-network agent comms with LAN pairing`);
+  log('');
+  log(`Server lifecycle (separate from this CLI):`);
+  log(`  npm start                      run the server (foreground)`);
+  log(`  bash scripts/configure.sh      interactive setup (mode, token, port)`);
+  log(`  bash scripts/install.sh        install the launchd/systemd service`);
+  log('');
+  log(`Pairing — initiator (the side that wants to connect):`);
+  log(`  agent-comms discover [--timeout 5]            UDP probe the LAN`);
+  log(`  agent-comms pair <endpoint> --code "..."      send pair request`);
+  log(`    Optional: --rel <tier> --expires <30d|6h|never|once> --name <my-name>`);
+  log('');
+  log(`Pairing — receiver (the side a request came in to):`);
+  log(`  agent-comms pending                           show inbound requests`);
+  log(`  agent-comms accept <id> [--rel ...] [--expires ...]`);
+  log(`  agent-comms block <id>                        block + 24h cooldown`);
+  log('');
+  log(`Local state:`);
+  log(`  agent-comms init [--name <name>]              first-run setup`);
+  log(`  agent-comms code                              show your pairing code`);
+  log(`  agent-comms code rotate                       regenerate pairing code`);
+  log(`  agent-comms peers                             list paired peers`);
+  log(`  agent-comms peers remove <local-id>           unpair`);
+  log('');
+  log(`Talks to the local server on ${LOCAL_BASE}.`);
+}
+
+async function main() {
+  const argv = process.argv.slice(2);
+  if (argv.length === 0) { usage(); process.exit(0); }
+  const cmd = argv[0];
+  const rest = argv.slice(1);
+  const { positional, flags } = parseArgs(rest);
+  try {
+    switch (cmd) {
+      case 'init':       await cmdInit(flags); break;
+      case 'code':       await cmdCode(positional); break;
+      case 'discover':   await cmdDiscover(flags); break;
+      case 'pair':       await cmdPair(positional, flags); break;
+      case 'pending':    await cmdPending(); break;
+      case 'accept':     await cmdAccept(positional, flags); break;
+      case 'block':      await cmdBlock(positional); break;
+      case 'peers':      await cmdPeers(positional); break;
+      case '-h': case '--help': case 'help': usage(); break;
+      default:
+        log(`Unknown command: ${cmd}`); log('');
+        usage(); process.exit(2);
+    }
+  } catch (e) {
+    fail(e.message || String(e));
+  }
+}
+
+main();
