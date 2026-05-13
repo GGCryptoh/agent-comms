@@ -8,6 +8,8 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Node](https://img.shields.io/badge/node-%3E%3D18-green.svg)](https://nodejs.org)
 
+![Agent-Comms topology — agents on different machines pushing context through a shared message harness](Agent-Comms_Topology.png)
+
 ---
 
 ## 60-second pair (the headline)
